@@ -1,0 +1,31 @@
+# Entorno virtual
+.venv/
+env/
+
+# Variables de entorno
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Outputs generados
+outputs/*.json
+outputs/*.md
+
+# Transcripcions
+transcriptions/*.txt
+transcriptions/*.docx
+
+# Archivos temporales
+*.log
+*.tmp
+
+# Sistema
+.DS_Store
+Thumbs.db
