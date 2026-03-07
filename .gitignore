@@ -18,6 +18,10 @@ __pycache__/
 outputs/*.json
 outputs/*.md
 
+# Reportes ejecutivos generados
+reports/*.json
+reports/*.md
+
 # Transcripcions
 transcriptions/*.txt
 transcriptions/*.docx

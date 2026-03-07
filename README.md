@@ -24,7 +24,8 @@ Convierte transcripciones `.docx` en JSON estructurado y minutas Markdown.
 ├── .env
 ├── requirements.txt
 ├── notebooks/
-│   └── pipeline.ipynb          ← Único punto de ejecución
+│   ├── pipeline.ipynb          ← Procesar transcripciones individuales
+│   └── report.ipynb            ← Generar reportes ejecutivos (semanal/mensual)
 ├── src/
 │   └── meeting_assistant/
 │       ├── __init__.py
@@ -35,12 +36,16 @@ Convierte transcripciones `.docx` en JSON estructurado y minutas Markdown.
 │       ├── chunking.py         ← División inteligente en bloques
 │       ├── io_transcripts.py   ← Lectura de .docx y .txt
 │       ├── extract_structured.py ← Llamada a Gemini + caché
-│       └── export_markdown.py  ← Generación de Markdown
+│       ├── export_markdown.py  ← Generación de Markdown (minutas)
+│       └── report.py           ← Reportes ejecutivos consolidados
 ├── transcriptions/
 │   └── *.docx                  ← Archivos de entrada
-└── outputs/
-    ├── *_structured.json   ← datos crudos (caché)
-    └── *.md                ← minuta para Notion
+├── outputs/
+│   ├── *_structured.json       ← datos crudos (caché)
+│   └── *.md                    ← minuta para Notion
+└── reports/
+    ├── reporte_semanal_*.json  ← reporte ejecutivo JSON
+    └── reporte_semanal_*.md    ← reporte ejecutivo Markdown
 ```
 
 ---
@@ -172,6 +177,25 @@ El proyecto está diseñado para minimizar el consumo de requests:
 Consumo estimado por reunión:
 - Reunión típica de 1h: **1 request**
 - Reunión muy larga (>45k chars post-procesado): **3–4 requests**
+
+---
+
+## Reportes Ejecutivos
+
+Genera reportes consolidados (semanal o mensual) a partir de las reuniones procesadas.
+
+Abrir `notebooks/report.ipynb` y ejecutar las celdas en orden:
+
+1. **Celda 1** — Configura `REPORT_TYPE` (`"semanal"` o `"mensual"`), `REF_DATE` y conecta con Gemini
+2. **Celda 2** — Lista todas las reuniones procesadas disponibles
+3. **Celda 3** — Filtra las reuniones del periodo seleccionado
+4. **Celda 4** — Busca reuniones del periodo anterior (para comparación de progreso)
+5. **Celda 5** — Genera el reporte y guarda en `reports/`
+6. **Celda 6** — Muestra vista previa del reporte en el notebook
+
+Los reportes se guardan en `reports/` (separados de las minutas individuales en `outputs/`).
+
+El prompt está optimizado para gerencia: formato breve, bullets concisos, indicadores visuales de estado por proyecto.
 
 ---
 
