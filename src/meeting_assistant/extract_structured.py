@@ -188,6 +188,114 @@ def repair_json(client, model: str, key_manager, candidate: str) -> dict:
     return json.loads(extract_json(fixed) or fixed)
 
 
+def extract_new_tasks(
+    client,
+    model: str,
+    key_manager,
+    data: dict,
+    existing_tasks: list[dict],
+) -> list[dict]:
+    """
+    Usa 1 request a Gemini para detectar action items nuevos en el contenido
+    de topics, decisions y next_steps que NO estén ya en existing_tasks.
+
+    Diseñado para usarse después de editar una reunión en Notion y hacer pull.
+
+    Returns:
+        Lista de dicts de action_items nuevos (validados). Vacía si no hay ninguno.
+    """
+    # Construir texto de las secciones relevantes
+    sections = []
+
+    topics = data.get("topics", [])
+    if topics:
+        parts = []
+        for t in topics:
+            name = t.get("name", "")
+            bullets = "\n".join(f"  - {b}" for b in (t.get("bullets") or []))
+            if bullets:
+                parts.append(f"### {name}\n{bullets}")
+        if parts:
+            sections.append("TEMAS TRATADOS:\n" + "\n\n".join(parts))
+
+    decisions = data.get("decisions", [])
+    if decisions:
+        parts = []
+        for d in decisions:
+            line = f"- {d.get('decision', '')}"
+            if d.get("owner"):
+                line += f" (Owner: {d['owner']})"
+            if d.get("due_date"):
+                line += f" (Fecha: {d['due_date']})"
+            parts.append(line)
+        sections.append("DECISIONES:\n" + "\n".join(parts))
+
+    next_steps = data.get("next_steps", [])
+    if next_steps:
+        sections.append("PROXIMOS PASOS:\n" + "\n".join(f"- {s}" for s in next_steps))
+
+    if not sections:
+        return []
+
+    content_text = "\n\n".join(sections)
+    active_tasks = [ai for ai in existing_tasks if not ai.get("notion_deleted")]
+    existing_texts = "\n".join(
+        f"- {ai.get('task', '')}" for ai in active_tasks if ai.get("task")
+    ) or "(ninguna)"
+
+    prompt = (
+        "Eres un asistente de reuniones. Analiza el contenido e identifica "
+        "UNICAMENTE action items accionables (verbo + responsable/entregable) "
+        "que NO esten ya en la lista de tareas existentes.\n\n"
+        f"CONTENIDO DE LA REUNION:\n{content_text}\n\n"
+        f"TAREAS YA REGISTRADAS (NO repetir estas ni parafrasearlas):\n{existing_texts}\n\n"
+        "Devuelve SOLO un JSON array. Si no hay tareas nuevas devuelve [].\n"
+        "Formato exacto de cada elemento:\n"
+        '{"task":"string","area":"string","owner":"string|null",'
+        '"due_date":"string|null","priority":"low|medium|high","status":"todo"}'
+    )
+
+    resp = call_with_key_rotation(
+        client=client, model=model, key_manager=key_manager,
+        fn_builder=lambda c: (lambda: c.models.generate_content(
+            model=model, contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json", temperature=0.1,
+            )
+        ))
+    )
+
+    raw = (resp.text or "").strip()
+    m = re.search(r"\[.*\]", raw, re.S)
+    if not m:
+        return []
+
+    try:
+        new_tasks = json.loads(m.group())
+    except Exception:
+        return []
+
+    if not isinstance(new_tasks, list):
+        return []
+
+    result = []
+    for item in new_tasks:
+        if not isinstance(item, dict):
+            continue
+        task_text = (item.get("task") or "").strip()
+        if len(task_text) < 5:
+            continue
+        if item.get("priority") not in _VALID_PRIORITY:
+            item["priority"] = "medium"
+        if item.get("status") not in _VALID_STATUS:
+            item["status"] = "todo"
+        if not item.get("area"):
+            item["area"] = "general"
+        result.append(item)
+
+    return result
+
+
 def load_cached(out_path: Path) -> dict | None:
     """Devuelve el JSON cacheado si existe, o None si no."""
     if out_path.exists():

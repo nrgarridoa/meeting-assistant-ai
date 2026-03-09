@@ -47,6 +47,101 @@ def _get_notion_client(env_path: str = ".env"):
     return Client(auth=token)
 
 
+# ─────────────────────────────────────────────
+# NOTION BLOCKS → MARKDOWN
+# ─────────────────────────────────────────────
+
+def _get_rich_text(rich_text_arr: list) -> str:
+    """Extrae plain_text de un array rich_text de Notion."""
+    return "".join(rt.get("plain_text", "") for rt in rich_text_arr)
+
+
+def _fetch_table_rows(client, table_block_id: str) -> list[dict]:
+    """Obtiene todas las filas de un bloque de tipo tabla."""
+    rows = []
+    has_more = True
+    start_cursor = None
+    while has_more:
+        kwargs = {"block_id": table_block_id, "page_size": 100}
+        if start_cursor:
+            kwargs["start_cursor"] = start_cursor
+        try:
+            resp = client.blocks.children.list(**kwargs)
+        except Exception:
+            break
+        rows.extend(resp.get("results", []))
+        has_more = resp.get("has_more", False)
+        start_cursor = resp.get("next_cursor")
+    return rows
+
+
+def _fetch_all_blocks(client, page_id: str) -> list[dict]:
+    """Obtiene todos los bloques de una pagina, incluyendo filas de tablas."""
+    blocks = []
+    has_more = True
+    start_cursor = None
+    while has_more:
+        kwargs = {"block_id": page_id, "page_size": 100}
+        if start_cursor:
+            kwargs["start_cursor"] = start_cursor
+        try:
+            resp = client.blocks.children.list(**kwargs)
+        except Exception:
+            break
+        for block in resp.get("results", []):
+            if block.get("type") == "table":
+                rows = _fetch_table_rows(client, block["id"])
+                block.setdefault("table", {})["children"] = rows
+            blocks.append(block)
+        has_more = resp.get("has_more", False)
+        start_cursor = resp.get("next_cursor")
+    return blocks
+
+
+def _blocks_to_markdown(blocks: list[dict]) -> str:
+    """Convierte bloques de Notion de vuelta a Markdown."""
+    lines = []
+    for block in blocks:
+        btype = block.get("type", "")
+
+        if btype == "heading_1":
+            text = _get_rich_text(block["heading_1"].get("rich_text", []))
+            lines.append(f"# {text}")
+        elif btype == "heading_2":
+            text = _get_rich_text(block["heading_2"].get("rich_text", []))
+            lines.append(f"## {text}")
+        elif btype == "heading_3":
+            text = _get_rich_text(block["heading_3"].get("rich_text", []))
+            lines.append(f"### {text}")
+        elif btype == "bulleted_list_item":
+            text = _get_rich_text(block["bulleted_list_item"].get("rich_text", []))
+            # Detectar sub-items (indented bullets para evidencia)
+            indent = "  " if block.get("_indent") else ""
+            lines.append(f"{indent}- {text}")
+        elif btype == "paragraph":
+            text = _get_rich_text(block["paragraph"].get("rich_text", []))
+            lines.append(text)
+        elif btype == "quote":
+            text = _get_rich_text(block["quote"].get("rich_text", []))
+            lines.append(f"> {text}")
+        elif btype == "divider":
+            lines.append("---")
+        elif btype == "table":
+            table = block.get("table", {})
+            rows = table.get("children", [])
+            for row_idx, row in enumerate(rows):
+                cells = [
+                    _get_rich_text(cell) if cell else ""
+                    for cell in row.get("table_row", {}).get("cells", [])
+                ]
+                lines.append("| " + " | ".join(cells) + " |")
+                if row_idx == 0:
+                    lines.append("|" + "|".join(["---|"] * len(cells)))
+        elif btype == "child_page":
+            pass  # Ignorar subpaginas
+    return "\n".join(lines)
+
+
 def _get_parent_page_id(page_type: str, env_path: str = ".env") -> str:
     """Obtiene el ID de la pagina padre segun el tipo (minuta -> Meetings, reporte -> Reports)."""
     load_dotenv(env_path)
@@ -186,9 +281,9 @@ def upload_to_notion(
     date: str | None = None,
     page_type: str = "minuta",
     env_path: str = ".env",
-) -> str:
+) -> dict:
     """
-    Sube un documento Markdown como pagina en una database de Notion.
+    Sube un documento Markdown como pagina en Notion.
 
     Args:
         md_text: Contenido Markdown completo.
@@ -198,7 +293,7 @@ def upload_to_notion(
         env_path: Ruta al .env con NOTION_TOKEN y NOTION_DB_ID.
 
     Returns:
-        URL de la pagina creada en Notion.
+        dict con {"url": str, "page_id": str}
     """
     client = _get_notion_client(env_path)
     parent_id = _get_parent_page_id(page_type, env_path)
@@ -219,16 +314,16 @@ def upload_to_notion(
     )
 
     page_url = page.get("url", "")
+    page_id = page["id"]
 
     # Si hay mas de 100 bloques, agregar en batches
     remaining = blocks[100:]
-    page_id = page["id"]
     while remaining:
         batch = remaining[:100]
         remaining = remaining[100:]
         client.blocks.children.append(block_id=page_id, children=batch)
 
-    return page_url
+    return {"url": page_url, "page_id": page_id}
 
 
 # ─────────────────────────────────────────────
@@ -318,21 +413,28 @@ def upload_tasks_to_notion(
     env_path: str = ".env",
     *,
     update_existing: bool = True,
+    out_dir=None,
 ) -> dict:
     """
     Sube action items de reuniones como entries en una database de Notion.
 
     Si update_existing=True, busca tareas existentes por texto similar
     y actualiza su status en vez de duplicar.
+    Salta tareas marcadas con notion_deleted=True.
+    Si out_dir se provee, guarda notion_page_id en el JSON local al crear.
 
     Args:
         meetings: Lista de JSONs estructurados (con _source_file y _date).
         env_path: Ruta al .env.
         update_existing: Si True, actualiza tareas que ya existen en Notion.
+        out_dir: Directorio de outputs para guardar notion_page_id en JSONs locales.
 
     Returns:
-        dict con {created: int, updated: int, errors: list[str]}
+        dict con {created: int, updated: int, skipped: int, errors: list[str]}
     """
+    import json
+    from pathlib import Path
+
     client = _get_notion_client(env_path)
     tasks_db_id = _get_tasks_db_id(env_path)
 
@@ -353,14 +455,22 @@ def upload_tasks_to_notion(
         title = m.get("meeting_title", source)
         project = _infer_project(source, title)
 
+        json_path = Path(out_dir) / f"{source}_structured.json" if out_dir and source and source != "?" else None
+        json_modified = False
+
         for a in m.get("action_items", []):
             task_text = a.get("task", "").strip()
             if not task_text:
                 continue
 
+            # Saltar tareas eliminadas en Notion via notion-pull
+            if a.get("notion_deleted"):
+                result["skipped"] += 1
+                continue
+
             try:
                 # Check if task already exists
-                existing_id = _find_existing_task(task_text, existing)
+                existing_id = a.get("notion_page_id") or _find_existing_task(task_text, existing)
 
                 if existing_id and update_existing:
                     # Update status only
@@ -370,7 +480,7 @@ def upload_tasks_to_notion(
                     result["skipped"] += 1
                 else:
                     # Create new entry
-                    _create_task_entry(
+                    page_id = _create_task_entry(
                         client, tasks_db_id,
                         task=task_text,
                         owner=a.get("owner", ""),
@@ -382,8 +492,26 @@ def upload_tasks_to_notion(
                         date=date,
                     )
                     result["created"] += 1
+                    # Guardar page_id en el action_item para detectar deletions futuras
+                    a["notion_page_id"] = page_id
+                    json_modified = True
             except Exception as e:
                 result["errors"].append(f"{task_text[:50]}...: {e}")
+
+        # Guardar JSON local si se agregaron notion_page_ids
+        if json_modified and json_path and json_path.exists():
+            try:
+                # Recargar para no perder campos que no estan en memoria (_date serializado, etc)
+                raw = json.loads(json_path.read_text(encoding="utf-8"))
+                # Actualizar notion_page_id en cada action_item por texto exacto
+                notion_ids = {a.get("task", ""): a.get("notion_page_id") for a in m.get("action_items", []) if a.get("notion_page_id")}
+                for ai in raw.get("action_items", []):
+                    pid = notion_ids.get(ai.get("task", ""))
+                    if pid:
+                        ai["notion_page_id"] = pid
+                json_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass  # No critico — el page_id se puede recuperar en el proximo pull
 
     return result
 
@@ -495,7 +623,8 @@ def _create_task_entry(
     if date:
         properties["Date"] = {"date": {"start": date}}
 
-    client.pages.create(parent={"database_id": db_id}, properties=properties)
+    page = client.pages.create(parent={"database_id": db_id}, properties=properties)
+    return page["id"]
 
 
 def _update_task_status(client, page_id: str, status: str):
@@ -588,28 +717,32 @@ def pull_tasks_from_notion(
 def sync_notion_to_local(
     out_dir,
     env_path: str = ".env",
+    solo_tareas: bool = False,
+    solo_paginas: bool = False,
+    refresh_tasks: bool = False,
 ) -> dict:
     """
     Sincroniza cambios de Notion de vuelta a los JSONs locales.
 
-    1. Lee todas las tareas de Notion con status/priority/owner actuales.
-    2. Para cada tarea con Meeting asignado, busca el JSON local correspondiente
-       y actualiza el action_item con los valores de Notion.
-    3. Tareas sin Meeting (manuales) se guardan en un archivo separado
-       (_notion_manual_tasks.json) para inclusion en reportes.
+    FASE 1 — Contenido de meeting pages:
+      Para cada JSON local con notion_meeting_page_id, lee el contenido
+      de la pagina en Notion, reconstruye el MD y actualiza el JSON local
+      (titulo, resumen, temas, decisiones, tareas, etc.) y el MD local.
+
+    FASE 2 — Tasks Database:
+      Lee todas las tareas de la Tasks DB y actualiza status/priority/owner/area
+      en los JSONs locales. Detecta eliminaciones y las marca notion_deleted.
 
     Returns:
-        dict con {updated: int, manual: int, unmatched: int, files_modified: list[str]}
+        dict con {pages_updated, updated, deleted, manual, unmatched, files_modified}
     """
     import json
     from pathlib import Path
     from difflib import SequenceMatcher
+    from .export_markdown import parse_md_to_structured, to_markdown
 
     out_dir = Path(out_dir)
-    notion_tasks = pull_tasks_from_notion(env_path)
-
-    if not notion_tasks:
-        return {"updated": 0, "manual": 0, "unmatched": 0, "files_modified": []}
+    client = _get_notion_client(env_path)
 
     # Cargar todos los JSONs locales
     local_files = {}  # {path: data}
@@ -620,35 +753,134 @@ def sync_notion_to_local(
         except Exception:
             continue
 
-    result = {"updated": 0, "manual": 0, "unmatched": 0, "files_modified": set()}
+    result = {
+        "pages_updated": 0,
+        "updated": 0, "deleted": 0,
+        "manual": 0, "unmatched": 0,
+        "new_tasks_added": 0,
+        "files_modified": set(),
+    }
+    phase1_modified = set()  # archivos actualizados desde contenido de Notion page
+
+    # Lazy init del cliente AI (solo si --refresh-tasks)
+    _ai_client = _ai_model = _ai_km = None
+    if refresh_tasks and not solo_tareas:
+        try:
+            from .gemini_client import make_client
+            _ai_client, _ai_model, _ai_km = make_client(env_path)
+            print("  [--refresh-tasks] Cliente AI inicializado.")
+        except Exception as e:
+            print(f"  [warn] No se pudo inicializar cliente AI para refresh-tasks: {e}")
+
+    # ── FASE 1: Pull contenido de meeting pages ───────────────────────────────
+    if solo_tareas:
+        print("  [--solo-tareas] Omitiendo sync de contenido de páginas.")
+    for path, data in (local_files.items() if not solo_tareas else []):
+        meeting_page_id = data.get("notion_meeting_page_id")
+        if not meeting_page_id:
+            continue
+
+        try:
+            blocks = _fetch_all_blocks(client, meeting_page_id)
+            if not blocks:
+                continue
+
+            notion_md = _blocks_to_markdown(blocks)
+            if not notion_md.strip():
+                continue
+
+            # Parsear el MD de Notion → estructura JSON actualizada
+            updated_data = parse_md_to_structured(notion_md, existing_json=data)
+
+            # Verificar si hubo cambios reales comparando campos clave
+            changed = False
+            for field in ("meeting_title", "summary_top_bullets", "topics",
+                          "decisions", "action_items", "risks_blockers",
+                          "open_questions", "next_steps", "speakers"):
+                if updated_data.get(field) != data.get(field):
+                    changed = True
+                    break
+
+            if changed:
+                local_files[path] = updated_data
+                result["pages_updated"] += 1
+                result["files_modified"].add(path.name)
+                phase1_modified.add(path)
+                print(f"  [page] {path.name} actualizado desde Notion")
+
+                # ── refresh-tasks: buscar tareas nuevas en el contenido editado ──
+                if _ai_client:
+                    try:
+                        from .extract_structured import extract_new_tasks
+                        new_tasks = extract_new_tasks(
+                            _ai_client, _ai_model, _ai_km,
+                            updated_data,
+                            updated_data.get("action_items", []),
+                        )
+                        if new_tasks:
+                            local_files[path]["action_items"] = (
+                                local_files[path].get("action_items", []) + new_tasks
+                            )
+                            result["new_tasks_added"] += len(new_tasks)
+                            print(f"    +{len(new_tasks)} tarea(s) nueva(s) detectada(s)")
+                    except Exception as e:
+                        print(f"  [warn] refresh-tasks fallo para {path.name}: {e}")
+
+        except Exception as e:
+            print(f"  [warn] No se pudo leer pagina Notion para {path.name}: {e}")
+            continue
+
+    # ── FASE 2: Sync Tasks Database ───────────────────────────────────────────
+    if solo_paginas:
+        print("  [--solo-paginas] Omitiendo sync de Tasks DB.")
+        # Guardar cambios de fase 1 y salir
+        for path, data in local_files.items():
+            if path.name in result["files_modified"]:
+                path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                if path in phase1_modified:
+                    md_path = path.parent / path.name.replace("_structured.json", ".md")
+                    md_path.write_text(to_markdown(data), encoding="utf-8")
+        result["files_modified"] = sorted(result["files_modified"])
+        return result
+
+    notion_tasks = pull_tasks_from_notion(env_path)
+    if not notion_tasks:
+        result["files_modified"] = sorted(result["files_modified"])
+        return result
+
     manual_tasks = []
+    active_page_ids = {nt["page_id"] for nt in notion_tasks if nt.get("page_id")}
 
     for nt in notion_tasks:
-        # Tareas manuales (sin meeting de origen)
         if not nt["meeting"]:
             manual_tasks.append(nt)
             continue
 
-        # Buscar en JSONs locales
         matched = False
         for path, data in local_files.items():
             for ai in data.get("action_items", []):
                 local_text = ai.get("task", "").strip().lower()
                 notion_text = nt["task"].strip().lower()
 
-                # Match exacto o por similitud alta
-                if local_text == notion_text or (
+                page_id_match = ai.get("notion_page_id") and ai["notion_page_id"] == nt["page_id"]
+                text_match = local_text == notion_text or (
                     len(local_text) > 10
                     and SequenceMatcher(None, local_text, notion_text).ratio() > 0.85
-                ):
-                    # Actualizar campos del action_item local
+                )
+
+                if page_id_match or text_match:
                     changed = False
                     for field in ("status", "priority", "owner", "area"):
                         notion_val = nt.get(field, "")
                         if notion_val and notion_val != ai.get(field, ""):
                             ai[field] = notion_val
                             changed = True
-
+                    if not ai.get("notion_page_id") and nt.get("page_id"):
+                        ai["notion_page_id"] = nt["page_id"]
+                        changed = True
+                    if ai.get("notion_deleted"):
+                        ai.pop("notion_deleted")
+                        changed = True
                     if changed:
                         result["updated"] += 1
                         result["files_modified"].add(path.name)
@@ -658,17 +890,26 @@ def sync_notion_to_local(
                 break
 
         if not matched:
-            # Tiene meeting pero no se encontro el JSON — tratar como manual
             manual_tasks.append(nt)
             result["unmatched"] += 1
 
-    # Guardar JSONs locales modificados
+    # Detectar tareas eliminadas en Notion
+    for path, data in local_files.items():
+        for ai in data.get("action_items", []):
+            pid = ai.get("notion_page_id")
+            if pid and pid not in active_page_ids and not ai.get("notion_deleted"):
+                ai["notion_deleted"] = True
+                result["deleted"] += 1
+                result["files_modified"].add(path.name)
+
+    # Guardar todos los JSONs modificados (fase 1 + fase 2 ya aplicados en memoria)
     for path, data in local_files.items():
         if path.name in result["files_modified"]:
-            path.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            # Regenerar MD solo para los archivos que cambiaron en fase 1
+            if path in phase1_modified:
+                md_path = path.parent / path.name.replace("_structured.json", ".md")
+                md_path.write_text(to_markdown(data), encoding="utf-8")
 
     # Guardar tareas manuales
     if manual_tasks:
@@ -680,6 +921,186 @@ def sync_notion_to_local(
         result["manual"] = len(manual_tasks)
 
     result["files_modified"] = sorted(result["files_modified"])
+    return result
+
+
+def _filename_to_title(stem: str) -> str:
+    """Retorna el stem del archivo tal cual, sin transformacion."""
+    return stem
+
+
+def _get_uploaded_meeting_pages(client, parent_page_id: str) -> dict[str, str]:
+    """
+    Lista las paginas ya subidas como hijos del parent page de Meetings.
+    Retorna dict {title_lower: page_id} para comparacion y tracking.
+    """
+    pages = {}
+    has_more = True
+    start_cursor = None
+
+    while has_more:
+        kwargs = {"block_id": parent_page_id, "page_size": 100}
+        if start_cursor:
+            kwargs["start_cursor"] = start_cursor
+        try:
+            resp = client.blocks.children.list(**kwargs)
+        except Exception:
+            break
+        for block in resp.get("results", []):
+            if block.get("type") == "child_page":
+                title = block.get("child_page", {}).get("title", "")
+                if title:
+                    pages[title.lower()] = block["id"]
+        has_more = resp.get("has_more", False)
+        start_cursor = resp.get("next_cursor")
+
+    return pages
+
+
+def link_notion_pages_to_local(
+    out_dir,
+    env_path: str = ".env",
+) -> dict:
+    """
+    Empareja paginas existentes en Notion con los JSONs locales y guarda
+    notion_meeting_page_id en cada JSON que aun no lo tenga.
+
+    Usa matching exacto por titulo (stem) y fuzzy como fallback (ratio > 0.70).
+    No sube ni modifica nada en Notion.
+
+    Returns:
+        dict con {linked: int, already_linked: int, unmatched: list[str]}
+    """
+    import json
+    from pathlib import Path
+    from difflib import SequenceMatcher
+
+    out_dir = Path(out_dir)
+    client = _get_notion_client(env_path)
+    parent_id = _get_parent_page_id("minuta", env_path)
+
+    notion_pages = _get_uploaded_meeting_pages(client, parent_id)
+    print(f"  Paginas en Notion: {len(notion_pages)}")
+
+    result = {"linked": 0, "already_linked": 0, "unmatched": []}
+
+    json_files = sorted(out_dir.glob("*_structured.json"))
+    for json_path in json_files:
+        try:
+            raw = json.loads(json_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        if raw.get("notion_meeting_page_id"):
+            result["already_linked"] += 1
+            continue
+
+        stem = json_path.stem.replace("_structured", "")
+        stem_lower = stem.lower()
+
+        # Match exacto
+        matched_id = notion_pages.get(stem_lower)
+
+        # Fuzzy fallback
+        if not matched_id:
+            best_ratio = 0
+            for notion_title_lower, page_id in notion_pages.items():
+                ratio = SequenceMatcher(None, stem_lower, notion_title_lower).ratio()
+                if ratio > best_ratio and ratio > 0.70:
+                    best_ratio = ratio
+                    matched_id = page_id
+
+        if matched_id:
+            raw["notion_meeting_page_id"] = matched_id
+            json_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"  [link] {json_path.name}")
+            result["linked"] += 1
+        else:
+            result["unmatched"].append(stem)
+
+    return result
+
+
+def upload_pending_meetings(
+    out_dir,
+    env_path: str = ".env",
+) -> dict:
+    """
+    Detecta MDs en out_dir que aun no estan en Notion y los sube.
+    Guarda notion_meeting_page_id en el JSON correspondiente para habilitar pull futuro.
+
+    Returns:
+        dict con {uploaded: int, skipped: int, errors: list[str], pages: list}
+    """
+    import json
+    import re as _re
+    from pathlib import Path
+
+    out_dir = Path(out_dir)
+    client = _get_notion_client(env_path)
+    parent_id = _get_parent_page_id("minuta", env_path)
+
+    # Obtener paginas ya subidas {title_lower: page_id}
+    uploaded_pages = _get_uploaded_meeting_pages(client, parent_id)
+
+    # Listar MDs en outputs (excluir reportes y archivos internos)
+    md_files = sorted(
+        p for p in out_dir.glob("*.md")
+        if not p.name.startswith("_") and not p.name.startswith("reporte")
+    )
+
+    result = {"uploaded": 0, "skipped": 0, "errors": [], "pages": []}
+
+    for md_path in md_files:
+        title = _filename_to_title(md_path.stem)
+        json_path = out_dir / f"{md_path.stem}_structured.json"
+
+        # Verificar si ya fue subido
+        if title.lower() in uploaded_pages:
+            existing_page_id = uploaded_pages[title.lower()]
+            # Guardar page_id en JSON si aun no lo tiene
+            if json_path.exists():
+                try:
+                    raw = json.loads(json_path.read_text(encoding="utf-8"))
+                    if not raw.get("notion_meeting_page_id"):
+                        raw["notion_meeting_page_id"] = existing_page_id
+                        json_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+            print(f"  [skip] {md_path.name} → ya en Notion")
+            result["skipped"] += 1
+            continue
+
+        try:
+            md_text = md_path.read_text(encoding="utf-8")
+            date = None
+            m = _re.match(r"^(\d{2})(\d{2})(\d{2})_", md_path.stem)
+            if m:
+                yy, mm, dd = m.group(1), m.group(2), m.group(3)
+                date = f"20{yy}-{mm}-{dd}"
+
+            page_info = upload_to_notion(md_text, title=title, date=date,
+                                         page_type="minuta", env_path=env_path)
+            url = page_info["url"]
+            page_id = page_info["page_id"]
+
+            # Guardar notion_meeting_page_id en el JSON local
+            if json_path.exists():
+                try:
+                    raw = json.loads(json_path.read_text(encoding="utf-8"))
+                    raw["notion_meeting_page_id"] = page_id
+                    json_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+
+            print(f"  [ok]   {md_path.name} → {url}")
+            result["uploaded"] += 1
+            result["pages"].append({"file": md_path.name, "title": title, "url": url, "page_id": page_id})
+        except Exception as e:
+            msg = f"{md_path.name}: {e}"
+            print(f"  [err]  {msg}")
+            result["errors"].append(msg)
+
     return result
 
 

@@ -18,14 +18,20 @@ Pipeline completo: `.docx` → JSON estructurado → Markdown → PDF → Notion
 - Exporta reportes a PDF profesional
 - Sincronizacion bidireccional con Notion:
   - **Push**: minutas como paginas, tareas como entries en database
-  - **Pull**: descarga cambios de status/prioridad/owner desde Notion
+  - **Pull selectivo**: `--solo-paginas` o `--solo-tareas` para sincronizar solo lo necesario
+  - `--refresh-tasks`: detecta tareas nuevas en contenido editado en Notion (1 request Gemini)
+  - `notion-link`: empareja JSONs locales con paginas existentes en Notion (fuzzy matching)
   - Tareas manuales agregadas en Notion se incluyen en reportes
+- Reportes ejecutivos enriquecidos con secciones de datos reales (0 requests extra):
+  - **Estado por Proyecto**: tabla con total/hecho/en-curso/bloqueado/pendiente por proyecto
+  - **Tareas Bloqueadas**: lista con owner y proyecto para escalar inmediatamente
+  - **Alertas de Vencimiento**: top 10 tareas vencidas o estancadas con razon
 - Seguimiento de action items entre periodos (carry-over, completadas, nuevas)
 - Busqueda sobre reuniones procesadas (decisiones, tareas, temas, speakers)
-- Dashboard de metricas (sin consumir requests)
+- Dashboard de metricas KPI (0 requests Gemini)
 - Deteccion fuzzy de speakers duplicados
 - Maneja multiples API Keys con rotacion automatica
-- CLI completo (`python -m meeting_assistant`)
+- CLI completo con 13 comandos (`python -m meeting_assistant`)
 
 ---
 
@@ -105,9 +111,6 @@ SMTP_PORT=587
 SMTP_USER=tucorreo@gmail.com
 SMTP_PASSWORD=xxxx xxxx xxxx xxxx
 SMTP_TO=destinatario@empresa.com
-NOTION_MEETINGS_DB_ID=xxx    # Database/pagina de minutas
-NOTION_REPORTS_DB_ID=xxx     # Database/pagina de reportes
-NOTION_TASKS_DB_ID=xxx       # Database de action items
 ```
 
 ### Configurar Gemini
@@ -176,13 +179,21 @@ python -m meeting_assistant search "Harold" --scope speakers          # Solo spe
 python -m meeting_assistant tracking --fecha 2026-03-04 --tipo semanal
 python -m meeting_assistant tracking --project HH4M                   # Filtrar por proyecto
 
+# ── Notion: Enlazar paginas existentes ──
+python -m meeting_assistant notion-link                               # Emparejar JSONs locales con Notion
+
 # ── Notion: Push ──
+python -m meeting_assistant notion-push                               # Subir MDs pendientes a Notion
 python -m meeting_assistant notion --file outputs/260304_daily-team.md --title "Daily" --type minuta
 python -m meeting_assistant notion-tasks                              # Subir todas las tareas
 python -m meeting_assistant notion-tasks --fecha 2026-03-04           # Solo de una semana
+python -m meeting_assistant notion-tasks --reset                      # Limpiar IDs y re-subir todo
 
 # ── Notion: Pull (sincronizar cambios de vuelta) ──
-python -m meeting_assistant notion-pull                               # Sync desde Notion
+python -m meeting_assistant notion-pull                               # Sync completo
+python -m meeting_assistant notion-pull --solo-paginas                # Solo contenido de reuniones
+python -m meeting_assistant notion-pull --solo-tareas                 # Solo Tasks DB
+python -m meeting_assistant notion-pull --solo-paginas --refresh-tasks  # + detectar tareas nuevas con IA
 python -m meeting_assistant notion-pull --show-manual                 # Mostrar tareas manuales
 
 # ── Templates de reunion ──
@@ -242,24 +253,35 @@ Action items ──────────────────────�
 
 ## Sincronizacion bidireccional con Notion
 
-### Push (local → Notion)
+### 1. Enlazar paginas existentes
+Si ya tienes minutas en Notion y quieres vincularlas con tus JSONs locales:
 ```bash
-python -m meeting_assistant notion-tasks          # Sube action items a DB
-python -m meeting_assistant notion --file X.md    # Sube minuta como pagina
+python -m meeting_assistant notion-link   # Fuzzy matching por titulo
 ```
 
-### Pull (Notion → local)
+### 2. Push (local → Notion)
 ```bash
-python -m meeting_assistant notion-pull           # Descarga cambios
-python -m meeting_assistant report --tipo semanal # Regenerar con cambios
+python -m meeting_assistant notion-push               # Sube MDs pendientes (auto-detecta)
+python -m meeting_assistant notion-tasks              # Sube action items a Tasks DB
+python -m meeting_assistant notion-tasks --reset      # Limpia IDs locales y re-sube todo
 ```
 
-### Ciclo de trabajo
+### 3. Pull (Notion → local)
+```bash
+python -m meeting_assistant notion-pull               # Sync completo (paginas + Tasks DB)
+python -m meeting_assistant notion-pull --solo-paginas              # Solo contenido de reuniones
+python -m meeting_assistant notion-pull --solo-tareas               # Solo Tasks DB
+python -m meeting_assistant notion-pull --solo-paginas --refresh-tasks  # + detecta tareas nuevas con IA
+```
+
+### Ciclo de trabajo recomendado
 1. Procesas transcripciones → se generan JSONs y MDs
-2. `notion-tasks` → sube tareas a Notion
-3. En Notion: marcas tareas como `done`, cambias prioridad, agregas tareas manuales
-4. `notion-pull` → sincroniza cambios de vuelta a los JSONs
-5. `report` → el reporte refleja el estado actual de las tareas
+2. `notion-push` → sube minutas nuevas a Notion
+3. `notion-tasks` → sube tareas a la Tasks DB
+4. En Notion: editas contenido, cambias estado de tareas, agregas tareas manuales
+5. `notion-pull --solo-paginas [--refresh-tasks]` → baja cambios de contenido
+6. `notion-pull --solo-tareas` → sincroniza cambios de Tasks DB al JSON local
+7. `report` → el reporte refleja el estado actual de las tareas
 
 ### Deteccion automatica de proyectos
 Al subir tareas, el sistema infiere el proyecto del nombre de archivo/titulo:
@@ -274,6 +296,35 @@ Al subir tareas, el sistema infiere el proyecto del nombre de archivo/titulo:
 | daily, codea | CODEa General |
 
 Puedes editar el mapeo en `notion_sync.py` (`_infer_project`) o asignar proyecto manualmente en Notion.
+
+---
+
+## Reportes enriquecidos
+
+Ademas del resumen generado por Gemini, los reportes (MD y PDF) incluyen automaticamente secciones basadas en datos reales, sin consumir requests adicionales:
+
+### Estado de Tareas por Proyecto
+
+Tabla con conteo de tareas por status para cada proyecto. Los proyectos con tareas bloqueadas se resaltan.
+
+| Proyecto | Total | Hecho | En curso | Bloqueado | Pendiente |
+|---|---|---|---|---|---|
+| **CODEa General** | 45 | 8 | 12 | **1** | 24 |
+| Chinalco | 16 | 3 | 2 | 0 | 11 |
+| MMM | 20 | 5 | 4 | 0 | 11 |
+
+### Tareas Bloqueadas
+
+Lista de tareas con `status = blocked`, con owner y proyecto. Permite identificar inmediatamente que esta frenando el avance de cada proyecto.
+
+### Alertas de Vencimiento
+
+Top 10 tareas vencidas o estancadas (>14 dias sin avance), con la razon del alerta.
+
+Generacion:
+```bash
+python -m meeting_assistant report --tipo semanal --pdf
+```
 
 ---
 

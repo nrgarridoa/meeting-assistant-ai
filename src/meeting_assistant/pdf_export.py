@@ -78,13 +78,16 @@ _STATUS_TEXT = {
 }
 
 
-def report_to_pdf(data: dict, output_path: Path) -> Path:
+def report_to_pdf(data: dict, output_path: Path, stats: dict | None = None) -> Path:
     """
     Genera un PDF ejecutivo a partir del dict de reporte.
 
     Args:
         data: JSON del reporte (output de generate_report).
         output_path: Ruta donde guardar el PDF.
+        stats: Metricas calculadas (output de compute_stats). Opcional.
+               Si se provee, agrega secciones de estado por proyecto,
+               tareas bloqueadas y alertas de vencimiento.
 
     Returns:
         Path del archivo PDF generado.
@@ -190,6 +193,81 @@ def report_to_pdf(data: dict, output_path: Path) -> Path:
             _bullet(pdf, r)
         pdf.set_text_color(50, 50, 50)
         pdf.ln(4)
+
+    # ── Secciones de datos reales (requieren stats) ────────────────────────────
+    if stats:
+        # Estado por proyecto
+        tasks_by_project = stats.get("tasks_by_project", {})
+        if tasks_by_project:
+            _section_title(pdf, "Estado de Tareas por Proyecto")
+            col_w = [70, 22, 22, 22, 26, 26]
+            headers = ["Proyecto", "Total", "Hecho", "En curso", "Bloqueado", "Pendiente"]
+            pdf.set_font(_FONT_NAME, "B", 8)
+            pdf.set_fill_color(230, 230, 230)
+            for i, h in enumerate(headers):
+                pdf.cell(col_w[i], 6, h, border=1, fill=True)
+            pdf.ln()
+            pdf.set_font(_FONT_NAME, "", 8)
+            for proj, counts in sorted(tasks_by_project.items()):
+                blocked_count = counts.get("blocked", 0)
+                if blocked_count > 0:
+                    pdf.set_text_color(180, 0, 0)
+                else:
+                    pdf.set_text_color(50, 50, 50)
+                pdf.cell(col_w[0], 5, _safe_text(proj), border=1)
+                pdf.set_text_color(50, 50, 50)
+                pdf.cell(col_w[1], 5, str(counts.get("total", 0)), border=1, align="C")
+                pdf.cell(col_w[2], 5, str(counts.get("done", 0)), border=1, align="C")
+                pdf.cell(col_w[3], 5, str(counts.get("in_progress", 0)), border=1, align="C")
+                # Bloqueado en rojo si > 0
+                if blocked_count > 0:
+                    pdf.set_text_color(180, 0, 0)
+                pdf.cell(col_w[4], 5, str(blocked_count), border=1, align="C")
+                pdf.set_text_color(50, 50, 50)
+                pdf.cell(col_w[5], 5, str(counts.get("todo", 0)), border=1, align="C")
+                pdf.ln()
+            pdf.ln(4)
+
+        # Tareas bloqueadas
+        blocked_tasks = stats.get("blocked_tasks", [])
+        if blocked_tasks:
+            _section_title(pdf, f"Tareas Bloqueadas ({len(blocked_tasks)})")
+            pdf.set_font(_FONT_NAME, "I", 9)
+            pdf.set_text_color(100, 100, 100)
+            pdf.cell(0, 5, "Requieren accion inmediata para desbloquear el avance.",
+                     new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(2)
+            for t in blocked_tasks:
+                pri = t.get("priority", "medium").upper()
+                text = f"[{pri}] {t.get('task', '')}"
+                if t.get("owner"):
+                    text += f" — {t['owner']}"
+                if t.get("project"):
+                    text += f" ({t['project']})"
+                pdf.set_text_color(180, 0, 0)
+                _bullet(pdf, text)
+                pdf.set_text_color(50, 50, 50)
+            pdf.ln(4)
+
+        # Alertas vencidas
+        overdue = stats.get("overdue_tasks", [])
+        if overdue:
+            _section_title(pdf, f"Alertas — {len(overdue)} Tareas Vencidas o Estancadas")
+            for t in overdue[:10]:
+                pri = t.get("priority", "medium").upper()
+                text = f"[{pri}] {t.get('task', '')[:65]}"
+                if t.get("owner"):
+                    text += f" — {t['owner']}"
+                pdf.set_text_color(180, 60, 0)
+                _bullet(pdf, text)
+                pdf.set_text_color(100, 100, 100)
+                _bullet(pdf, t.get("reason", ""))
+                pdf.set_text_color(50, 50, 50)
+            if len(overdue) > 10:
+                pdf.set_font(_FONT_NAME, "I", 8)
+                pdf.cell(0, 5, f"  ...y {len(overdue) - 10} tareas mas",
+                         new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(4)
 
     # ── Recomendaciones ──
     recs = data.get("recommendations", [])

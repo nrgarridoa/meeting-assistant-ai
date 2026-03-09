@@ -1,17 +1,25 @@
 """
 CLI para Meeting Assistant.
 
-Uso:
-  python -m meeting_assistant process [--context "..."]
-  python -m meeting_assistant report --tipo semanal [--fecha 2026-03-04] [--pdf] [--email]
-  python -m meeting_assistant stats [--fecha 2026-03-04] [--tipo semanal] [--project Chinalco] [--pdf] [--compare]
-  python -m meeting_assistant search "Chinalco" [--scope decisions]
-  python -m meeting_assistant tracking [--fecha 2026-03-04] [--tipo semanal] [--project Chinalco]
-  python -m meeting_assistant notion --file outputs/260304_daily-team.md --title "Daily" --type minuta
-  python -m meeting_assistant notion-pull [--show-manual]
-  python -m meeting_assistant notion-tasks [--fecha 2026-03-04]
-  python -m meeting_assistant template --tipo daily [--fecha 2026-03-08] [--project Chinalco]
-  python -m meeting_assistant email --file reports/reporte_semanal_X.md [--attach reports/X.pdf]
+Comandos principales:
+  process       Procesar transcripciones .docx pendientes → JSON + MD
+  notion-link   Enlazar JSONs locales con sus paginas ya existentes en Notion
+  notion-push   Subir MDs nuevos a Notion (auto-detecta pendientes)
+  notion-pull   Sync Notion → local (--solo-paginas | --solo-tareas)
+  notion-tasks  Subir/actualizar tareas en Tasks DB de Notion
+  report        Reporte ejecutivo semanal o mensual (--pdf --notion --email)
+  stats         Dashboard de metricas KPI (--compare --pdf --project)
+  tracking      Seguimiento de action items entre periodos
+  search        Buscar en todas las reuniones procesadas
+  template      Generar agenda pre-llenada para próxima reunión
+  email         Enviar reporte por correo SMTP
+  flows         Ver todos los flujos de trabajo con ejemplos detallados
+
+Flujo rapido diario:
+  process → notion-push → notion-pull --solo-paginas → notion-tasks → notion-pull --solo-tareas
+
+Ver flujos completos:
+  python -m meeting_assistant flows
 """
 
 import argparse
@@ -127,12 +135,16 @@ def cmd_report(args):
 
     report_data = generate_report(client, model, km, current, label, prev or None)
 
+    # Stats para secciones de datos reales en el MD
+    from .stats import compute_stats
+    stats_data = compute_stats(current)
+
     safe_label = label.replace(" ", "_").replace("/", "-")
     out_json = REPORTS_DIR / f"reporte_{tipo}_{safe_label}.json"
     out_md = REPORTS_DIR / f"reporte_{tipo}_{safe_label}.md"
 
     out_json.write_text(json.dumps(report_data, ensure_ascii=False, indent=2), encoding="utf-8")
-    md_text = report_to_markdown(report_data)
+    md_text = report_to_markdown(report_data, stats=stats_data)
     out_md.write_text(md_text, encoding="utf-8")
     print(f"  JSON: {out_json}")
     print(f"  MD:   {out_md}")
@@ -141,15 +153,15 @@ def cmd_report(args):
     if args.pdf:
         from .pdf_export import report_to_pdf
         out_pdf = REPORTS_DIR / f"reporte_{tipo}_{safe_label}.pdf"
-        report_to_pdf(report_data, out_pdf)
+        report_to_pdf(report_data, out_pdf, stats=stats_data)
         print(f"  PDF:  {out_pdf}")
 
     if args.notion:
         from .notion_sync import upload_to_notion
-        url = upload_to_notion(md_text, title=report_data.get("report_title", label),
-                               date=date_from.strftime("%Y-%m-%d"),
-                               page_type="reporte", env_path=ENV_PATH)
-        print(f"  Notion: {url}")
+        page_info = upload_to_notion(md_text, title=report_data.get("report_title", label),
+                                     date=date_from.strftime("%Y-%m-%d"),
+                                     page_type="reporte", env_path=ENV_PATH)
+        print(f"  Notion: {page_info['url']}")
 
     if args.email:
         from .email_report import send_report_email
@@ -280,12 +292,12 @@ def cmd_notion(args):
         sys.exit(1)
 
     md_text = md_path.read_text(encoding="utf-8")
-    url = upload_to_notion(
+    page_info = upload_to_notion(
         md_text, title=args.title,
         date=args.date, page_type=args.type,
         env_path=ENV_PATH,
     )
-    print(f"Subido a Notion: {url}")
+    print(f"Subido a Notion: {page_info['url']}")
 
 
 def cmd_notion_pull(args):
@@ -293,9 +305,20 @@ def cmd_notion_pull(args):
     from .notion_sync import sync_notion_to_local, load_manual_tasks
 
     print("Sincronizando tareas desde Notion...")
-    result = sync_notion_to_local(OUT_DIR, env_path=ENV_PATH)
+    result = sync_notion_to_local(
+        OUT_DIR, env_path=ENV_PATH,
+        solo_tareas=args.solo_tareas,
+        solo_paginas=args.solo_paginas,
+        refresh_tasks=args.refresh_tasks,
+    )
 
-    print(f"  Actualizadas:  {result['updated']}")
+    if result.get("pages_updated"):
+        print(f"  Paginas sync:  {result['pages_updated']} (contenido + MD + JSON actualizados)")
+    if result.get("new_tasks_added"):
+        print(f"  Tareas nuevas: {result['new_tasks_added']} detectadas desde contenido editado (pendiente notion-tasks)")
+    print(f"  Tareas sync:   {result['updated']}")
+    if result.get("deleted"):
+        print(f"  Eliminadas:    {result['deleted']} (marcadas notion_deleted en JSON local)")
     print(f"  Manuales:      {result['manual']}")
     if result["unmatched"]:
         print(f"  Sin match:     {result['unmatched']}")
@@ -312,6 +335,38 @@ def cmd_notion_pull(args):
 
     print("\nSync completo. Regenera reportes para reflejar cambios:")
     print("  python -m meeting_assistant report --tipo semanal")
+
+
+def cmd_notion_link(args):
+    """Empareja paginas existentes en Notion con JSONs locales (guarda notion_meeting_page_id)."""
+    from .notion_sync import link_notion_pages_to_local
+
+    print("Enlazando paginas de Notion con JSONs locales...")
+    result = link_notion_pages_to_local(OUT_DIR, env_path=ENV_PATH)
+
+    print(f"  Enlazados:      {result['linked']}")
+    print(f"  Ya enlazados:   {result['already_linked']}")
+    if result["unmatched"]:
+        print(f"  Sin match ({len(result['unmatched'])}): {', '.join(result['unmatched'])}")
+        print("  (Esos archivos no tienen pagina en Notion aun. Usa notion-push para subirlos.)")
+    else:
+        print("  Todos los archivos enlazados correctamente.")
+    print("\nAhora puedes usar notion-pull para sincronizar cambios.")
+
+
+def cmd_notion_push(args):
+    """Sube a Notion todos los MDs de outputs que aun no estan alli."""
+    from .notion_sync import upload_pending_meetings
+
+    print("Detectando minutas pendientes de subir a Notion...")
+    result = upload_pending_meetings(OUT_DIR, env_path=ENV_PATH)
+
+    print(f"\n  Subidas:  {result['uploaded']}")
+    print(f"  Omitidas: {result['skipped']} (ya estaban en Notion)")
+    if result["errors"]:
+        print(f"  Errores:  {len(result['errors'])}")
+        for e in result["errors"]:
+            print(f"    - {e}")
 
 
 def cmd_notion_tasks(args):
@@ -338,12 +393,36 @@ def cmd_notion_tasks(args):
         print(f"Sin reuniones para el periodo ({label}).")
         sys.exit(0)
 
+    # --reset: limpia notion_page_id y notion_deleted de los JSONs locales
+    # Usar ANTES de re-subir todo tras haber borrado la BD en Notion
+    if args.reset:
+        reset_count = 0
+        for json_path in sorted(OUT_DIR.glob("*_structured.json")):
+            try:
+                raw = json.loads(json_path.read_text(encoding="utf-8"))
+                changed = False
+                for ai in raw.get("action_items", []):
+                    if "notion_page_id" in ai or "notion_deleted" in ai:
+                        ai.pop("notion_page_id", None)
+                        ai.pop("notion_deleted", None)
+                        changed = True
+                        reset_count += 1
+                if changed:
+                    json_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                continue
+        print(f"  Reset: {reset_count} IDs limpiados de JSONs locales.")
+        # Recargar meetings con los JSONs actualizados
+        all_meetings = load_all_meetings(OUT_DIR)
+        meetings = all_meetings if not args.fecha else filter_by_date_range(all_meetings, date_from, date_to)
+
     total_tasks = sum(len(m.get("action_items", [])) for m in meetings)
     print(f"Subiendo {total_tasks} tareas de {len(meetings)} reuniones ({label})...")
 
     result = upload_tasks_to_notion(
         meetings, env_path=ENV_PATH,
         update_existing=not args.no_update,
+        out_dir=OUT_DIR,
     )
 
     print(f"  Creadas:      {result['created']}")
@@ -418,10 +497,127 @@ def cmd_email(args):
     print(result)
 
 
+FLOWS_TEXT = """
+===============================================================
+  MEETING ASSISTANT -- FLUJOS DE TRABAJO
+===============================================================
+
+-- FLUJO DIARIO (despues de cada reunion) ---------------------
+  1. Coloca el .docx en transcriptions/
+  2. process           Genera JSON + MD en outputs/
+  3. notion-push       Sube MDs nuevos a Notion (auto-detecta pendientes)
+  4. [Edita en Notion] Corrige titulo, resumen, temas, decisiones
+  5. notion-pull --solo-paginas
+                       Baja cambios de Notion, actualiza MD + JSON local
+     OPCION: --refresh-tasks  Si editaste temas/decisiones y pueden haber
+                              surgido tareas nuevas, las detecta con IA
+                              (1 request Gemini por pagina modificada)
+  6. notion-tasks      Sube tareas a la Tasks DB de Notion
+                       (incluye las nuevas detectadas por --refresh-tasks)
+  7. [Edita Tasks DB]  Cambia estado, owner, prioridad en Notion
+  8. notion-pull --solo-tareas
+                       Sincroniza cambios de Tasks DB al JSON local
+
+  Comandos rapidos (sin refresh-tasks):
+    python -m meeting_assistant process
+    python -m meeting_assistant notion-push
+    python -m meeting_assistant notion-pull --solo-paginas
+    python -m meeting_assistant notion-tasks
+    python -m meeting_assistant notion-pull --solo-tareas
+
+  Con deteccion de tareas nuevas (paso 5):
+    python -m meeting_assistant notion-pull --solo-paginas --refresh-tasks
+
+-- FLUJO DE REPORTE SEMANAL (viernes) -------------------------
+  1. notion-pull       Asegura que todos los datos esten al dia
+  2. stats             Dashboard de KPIs + comparativa semana anterior
+  3. tracking          Ver estado de tareas pendientes vs semana anterior
+  4. report            Genera reporte ejecutivo MD + PDF (+ Notion + email)
+
+  El reporte incluye automaticamente (sin consumir requests Gemini):
+  - Estado por Proyecto: tabla con total/hecho/en-curso/bloqueado/pendiente
+  - Tareas Bloqueadas: lista con owner y proyecto (para escalar)
+  - Alertas de Vencimiento: top 10 tareas vencidas o estancadas
+
+  Comandos:
+    python -m meeting_assistant notion-pull
+    python -m meeting_assistant stats --fecha 2026-03-06 --tipo semanal --compare --pdf
+    python -m meeting_assistant tracking --fecha 2026-03-06
+    python -m meeting_assistant report --tipo semanal --fecha 2026-03-06 --pdf --notion --email
+
+-- FLUJO DE REPORTE MENSUAL (fin de mes) ----------------------
+  Comandos:
+    python -m meeting_assistant notion-pull
+    python -m meeting_assistant stats --fecha 2026-03-31 --tipo mensual --compare --pdf
+    python -m meeting_assistant report --tipo mensual --fecha 2026-03-31 --pdf --email
+
+-- FLUJO POR PROYECTO -----------------------------------------
+  Stats y tracking filtrados por proyecto especifico:
+
+    python -m meeting_assistant stats --project Chinalco --compare --pdf
+    python -m meeting_assistant tracking --project Chinalco
+    python -m meeting_assistant template --tipo daily --project Chinalco
+
+  Proyectos: Chinalco, MMM, HH4M, FMS, CODEa General, English for Miners
+             (keywords parciales funcionan: "china", "hh4", "fms", etc.)
+
+-- FLUJO DE BUSQUEDA ------------------------------------------
+    python -m meeting_assistant search "Chinalco"
+    python -m meeting_assistant search "presupuesto" --scope decisions
+    python -m meeting_assistant search "Juan"         --scope speakers
+    python -m meeting_assistant search "API"          --scope tasks
+
+  Scopes: all | decisions | tasks | topics | speakers
+
+-- FLUJO DE AGENDA / TEMPLATE ---------------------------------
+    python -m meeting_assistant template --tipo daily
+    python -m meeting_assistant template --tipo semanal --project Chinalco -o agenda.md
+
+-- FLUJO DE EMAIL ---------------------------------------------
+  (Requiere SMTP configurado en .env: SMTP_USER, SMTP_PASSWORD)
+
+    python -m meeting_assistant email --file reports/reporte_semanal_X.md
+    python -m meeting_assistant email --file reports/reporte_semanal_X.md \
+        --attach reports/reporte_semanal_X.pdf --subject "Reporte Semana 10"
+
+-- NOTION -- REFERENCIA RAPIDA --------------------------------
+  notion-link                 Enlaza JSONs locales con paginas ya existentes en Notion (fuzzy)
+  notion-push                 Sube MDs nuevos de outputs/ (auto-detecta)
+  notion-pull                 Sync completo: paginas + Tasks DB
+  notion-pull --solo-paginas           Solo contenido de reuniones (no tareas)
+  notion-pull --solo-tareas            Solo Tasks DB (no contenido de paginas)
+  notion-pull --refresh-tasks          Detecta tareas nuevas en contenido editado (IA)
+  notion-pull --solo-paginas --refresh-tasks  Combo recomendado post-edicion
+  notion-pull --show-manual            Muestra tareas manuales de Notion sin match
+  notion-tasks                Sube/actualiza tareas en Tasks DB
+  notion-tasks --no-update    Solo crea nuevas, no actualiza existentes
+  notion --file X.md --title "T" --type minuta
+                              Sube un MD especifico a Notion (manual)
+
+===============================================================
+  Ayuda de un comando: python -m meeting_assistant <comando> --help
+===============================================================
+"""
+
+
+def cmd_flows(_args):
+    """Muestra todos los flujos de trabajo disponibles."""
+    print(FLOWS_TEXT)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="meeting_assistant",
         description="Meeting Assistant AI — CLI",
+        epilog=(
+            "Flujos rapidos:\n"
+            "  Diario:  process > notion-push > notion-pull --solo-paginas > notion-tasks > notion-pull --solo-tareas\n"
+            "  Semanal: notion-pull > stats > tracking > report  (los viernes)\n"
+            "  Mensual: notion-pull > stats --tipo mensual > report --tipo mensual\n"
+            "\n"
+            "Ver flujos detallados con ejemplos: python -m meeting_assistant flows"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -464,10 +660,22 @@ def main():
     p_notion.add_argument("--date", default=None, help="Fecha YYYY-MM-DD")
     p_notion.add_argument("--type", default="minuta", choices=["minuta", "reporte"])
 
+    # notion-link
+    sub.add_parser("notion-link", help="Enlazar JSONs locales con sus paginas existentes en Notion")
+
+    # notion-push
+    sub.add_parser("notion-push", help="Subir a Notion todos los MDs pendientes de outputs/")
+
     # notion-pull
     p_npull = sub.add_parser("notion-pull", help="Descargar cambios de Notion a JSONs locales")
     p_npull.add_argument("--show-manual", action="store_true",
                          help="Mostrar lista de tareas manuales")
+    p_npull.add_argument("--solo-tareas", action="store_true",
+                         help="Solo sincroniza Tasks DB (omite contenido de pages)")
+    p_npull.add_argument("--solo-paginas", action="store_true",
+                         help="Solo sincroniza contenido de meeting pages (omite Tasks DB)")
+    p_npull.add_argument("--refresh-tasks", action="store_true",
+                         help="Detecta tareas nuevas en el contenido editado (usa 1 request Gemini por pagina)")
 
     # notion-tasks
     p_ntasks = sub.add_parser("notion-tasks", help="Subir action items a database de Notion")
@@ -475,6 +683,8 @@ def main():
     p_ntasks.add_argument("--tipo", "-t", default=None, choices=["semanal", "mensual"])
     p_ntasks.add_argument("--no-update", action="store_true",
                           help="No actualizar tareas existentes (solo crear nuevas)")
+    p_ntasks.add_argument("--reset", action="store_true",
+                          help="Limpia notion_page_id locales y re-sube todo como nuevo (usar tras borrar la BD en Notion)")
 
     # template
     p_tmpl = sub.add_parser("template", help="Generar agenda/template para reunion")
@@ -490,6 +700,9 @@ def main():
     p_email.add_argument("--subject", "-s", default=None, help="Asunto del correo")
     p_email.add_argument("--attach", "-a", nargs="*", help="Archivos adjuntos (PDFs, etc.)")
 
+    # flows
+    sub.add_parser("flows", help="Ver flujos de trabajo detallados con ejemplos")
+
     args = parser.parse_args()
 
     commands = {
@@ -499,10 +712,13 @@ def main():
         "search": cmd_search,
         "tracking": cmd_tracking,
         "notion": cmd_notion,
+        "notion-link": cmd_notion_link,
+        "notion-push": cmd_notion_push,
         "notion-pull": cmd_notion_pull,
         "notion-tasks": cmd_notion_tasks,
         "template": cmd_template,
         "email": cmd_email,
+        "flows": cmd_flows,
     }
     commands[args.command](args)
 

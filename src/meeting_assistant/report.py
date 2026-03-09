@@ -376,7 +376,7 @@ _STATUS_ICONS = {
 }
 
 
-def report_to_markdown(data: dict) -> str:
+def report_to_markdown(data: dict, stats: dict | None = None) -> str:
     """Convierte el JSON del reporte a Markdown ejecutivo breve para gerencia."""
     lines = []
     generated = data.get("_meta", {}).get("generated_at", "")
@@ -459,6 +459,59 @@ def report_to_markdown(data: dict) -> str:
         for r in recs:
             lines.append(f"- {r}")
         lines.append("")
+
+    # ── Secciones de datos reales (requieren stats) ────────────────────────────
+    if stats:
+        # Estado de tareas por proyecto
+        tasks_by_project = stats.get("tasks_by_project", {})
+        if tasks_by_project:
+            lines.append("## Estado de Tareas por Proyecto")
+            lines.append("")
+            lines.append("| Proyecto | Total | Hecho | En curso | Bloqueado | Pendiente |")
+            lines.append("|---|---|---|---|---|---|")
+            for proj, counts in sorted(tasks_by_project.items()):
+                total = counts.get("total", 0)
+                done = counts.get("done", 0)
+                in_prog = counts.get("in_progress", 0)
+                blocked = counts.get("blocked", 0)
+                todo = counts.get("todo", 0)
+                # Resaltar proyectos con bloqueados
+                proj_label = f"**{proj}**" if blocked > 0 else proj
+                lines.append(f"| {proj_label} | {total} | {done} | {in_prog} | {blocked} | {todo} |")
+            lines.append("")
+
+        # Tareas bloqueadas
+        blocked_tasks = stats.get("blocked_tasks", [])
+        if blocked_tasks:
+            lines.append("## Tareas Bloqueadas")
+            lines.append("")
+            lines.append("> Estas tareas requieren accion inmediata para desbloquear el avance.")
+            lines.append("")
+            for t in blocked_tasks:
+                pri_tag = f"[{t['priority'].upper()}]" if t.get("priority") == "high" else f"[{t.get('priority', 'medium')}]"
+                task_line = f"- {pri_tag} **{t.get('task', '')}**"
+                if t.get("owner"):
+                    task_line += f" — {t['owner']}"
+                if t.get("project"):
+                    task_line += f" _({t['project']})_"
+                lines.append(task_line)
+            lines.append("")
+
+        # Alertas de vencimiento
+        overdue = stats.get("overdue_tasks", [])
+        if overdue:
+            lines.append(f"## Alertas — {len(overdue)} Tareas Vencidas o Estancadas")
+            lines.append("")
+            for t in overdue[:10]:
+                pri_tag = f"[{t['priority'].upper()}]" if t.get("priority") == "high" else f"[{t.get('priority', 'medium')}]"
+                task_line = f"- {pri_tag} {t.get('task', '')[:70]}"
+                if t.get("owner"):
+                    task_line += f" — _{t['owner']}_"
+                lines.append(task_line)
+                lines.append(f"  _{t.get('reason', '')}_")
+            if len(overdue) > 10:
+                lines.append(f"- _...y {len(overdue) - 10} tareas mas_")
+            lines.append("")
 
     # Footer
     lines.append("---")

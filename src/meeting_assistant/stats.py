@@ -15,6 +15,24 @@ from .report import load_all_meetings, filter_by_date_range
 _PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 _STATUS_ORDER = {"blocked": 0, "in_progress": 1, "todo": 2, "done": 3}
 
+# ── Mapeo de keywords a nombres de proyecto ──
+_PROJECT_KEYWORDS = {
+    "Chinalco": ["chinalco", "china"],
+    "MMM": ["mmm"],
+    "HH4M": ["hh4m", "hh4"],
+    "FMS": ["fms"],
+    "English for Miners": ["english", "miners", "efm"],
+}
+
+
+def _infer_project_from_meeting(m: dict) -> str:
+    """Infiere el proyecto de una reunion a partir de su titulo y archivo fuente."""
+    text = (m.get("meeting_title", "") + " " + m.get("_source_file", "")).lower()
+    for project, keywords in _PROJECT_KEYWORDS.items():
+        if any(kw in text for kw in keywords):
+            return project
+    return "CODEa General"
+
 
 def _normalize_speakers(raw_names: set[str]) -> list[str]:
     """
@@ -165,19 +183,43 @@ def compute_stats(meetings: list[dict], project: str = "") -> dict:
     tasks_by_area = Counter()
     tasks_by_project = Counter()
 
+    tasks_by_project: dict[str, dict] = {}
+    blocked_tasks: list[dict] = []
+
     for m in meetings:
         for s in m.get("speakers", []):
             name = s.get("name", "").strip()
             if name:
                 raw_speakers.add(name)
 
+        proj = _infer_project_from_meeting(m)
+        if proj not in tasks_by_project:
+            tasks_by_project[proj] = {"total": 0, "done": 0, "in_progress": 0, "blocked": 0, "todo": 0}
+
         for a in m.get("action_items", []):
             all_actions.append(a)
             owner = a.get("owner") or "Sin asignar"
+            status = a.get("status", "todo")
             tasks_by_owner[owner] += 1
-            tasks_by_status[a.get("status", "todo")] += 1
+            tasks_by_status[status] += 1
             tasks_by_priority[a.get("priority", "medium")] += 1
             tasks_by_area[a.get("area", "general")] += 1
+
+            # Acumular por proyecto
+            tasks_by_project[proj]["total"] += 1
+            if status in tasks_by_project[proj]:
+                tasks_by_project[proj][status] += 1
+
+            # Tareas bloqueadas
+            if status == "blocked":
+                blocked_tasks.append({
+                    "task": a.get("task", ""),
+                    "owner": a.get("owner") or "Sin asignar",
+                    "priority": a.get("priority", "medium"),
+                    "area": a.get("area", ""),
+                    "project": proj,
+                    "source": m.get("_source_file", "?"),
+                })
 
         all_decisions.extend(m.get("decisions", []))
         all_risks.extend(m.get("risks_blockers", []))
@@ -208,6 +250,8 @@ def compute_stats(meetings: list[dict], project: str = "") -> dict:
         ),
         "overdue_tasks": overdue,
         "sorted_tasks": sorted_actions,
+        "tasks_by_project": tasks_by_project,
+        "blocked_tasks": blocked_tasks,
         "project_filter": project or "(todas)",
     }
 
