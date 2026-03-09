@@ -88,6 +88,42 @@ def load_all_meetings(out_dir: Path) -> list[dict]:
         except Exception as e:
             print(f"  Advertencia: no se pudo cargar {p.name}: {e}")
 
+    # Inyectar tareas manuales de Notion (si existen)
+    manual_path = out_dir / "_notion_manual_tasks.json"
+    if manual_path.exists():
+        try:
+            raw = json.loads(manual_path.read_text(encoding="utf-8"))
+            if raw:
+                # Agrupar por fecha para crear pseudo-reuniones
+                by_date = {}
+                for t in raw:
+                    d = t.get("date", "")[:10] or "sin_fecha"
+                    by_date.setdefault(d, []).append({
+                        "task": t.get("task", ""),
+                        "owner": t.get("owner", ""),
+                        "status": t.get("status", "todo"),
+                        "priority": t.get("priority", "medium"),
+                        "area": t.get("area", ""),
+                        "evidence": "[Manual - Notion]",
+                    })
+                for date_str, items in by_date.items():
+                    virtual = {
+                        "meeting_title": "Tareas manuales (Notion)",
+                        "speakers": [],
+                        "summary_top_bullets": [f"{len(items)} tareas agregadas manualmente en Notion"],
+                        "topics": [],
+                        "decisions": [],
+                        "action_items": items,
+                        "risks_blockers": [],
+                        "open_questions": [],
+                        "next_steps": [],
+                        "_source_file": "_notion_manual_tasks.json",
+                        "_date": datetime.strptime(date_str, "%Y-%m-%d") if date_str != "sin_fecha" else None,
+                    }
+                    meetings.append(virtual)
+        except Exception:
+            pass
+
     meetings.sort(key=lambda m: (m["_date"] is None, m["_date"] or datetime.max))
     return meetings
 

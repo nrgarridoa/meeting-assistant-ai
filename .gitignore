@@ -21,6 +21,7 @@ outputs/*.md
 # Reportes ejecutivos generados
 reports/*.json
 reports/*.md
+reports/*.pdf
 
 # Transcripcions
 transcriptions/*.txt

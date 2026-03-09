@@ -1,7 +1,7 @@
 from .gemini_client import make_client
 from .io_transcripts import load_transcript, list_transcripts
 from .preprocess import preprocess_transcript
-from .extract_structured import extract_structured, estimate_requests, load_cached
+from .extract_structured import extract_structured, estimate_requests, load_cached, get_validation_warnings
 from .export_markdown import to_markdown
 from .report import (
     load_all_meetings,
@@ -11,3 +11,8 @@ from .report import (
     generate_report,
     report_to_markdown,
 )
+from .stats import compute_stats, stats_to_text
+from .action_tracking import track_actions, tracking_to_text
+from .search import search_meetings, search_to_text
+from .pdf_export import report_to_pdf
+from .notion_sync import upload_to_notion, upload_tasks_to_notion, pull_tasks_from_notion, sync_notion_to_local, load_manual_tasks

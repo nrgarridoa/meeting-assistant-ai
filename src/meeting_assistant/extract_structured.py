@@ -62,11 +62,16 @@ _REQUIRED_FIELDS = {
 # ─────────────────────────────────────────────
 
 def _build_context_block(context: str) -> str:
-    """Construye el bloque de contexto para el prompt si se proporcionó."""
+    """Construye el bloque de contexto para el prompt."""
     ctx = context.strip() if context else ""
-    if not ctx:
-        return ""
-    return f"\nCONTEXTO DE LA REUNIÓN:\n{ctx}\n"
+    if ctx:
+        return f"\nCONTEXTO DE LA REUNIÓN:\n{ctx}\n"
+    return (
+        "\nINSTRUCCION: Detecta automaticamente el tipo de reunion "
+        "(daily, seguimiento de proyecto, estrategica, tecnica, etc.) "
+        "a partir de los primeros intercambios y participantes. "
+        "Usa esa inferencia para guiar la extraccion de informacion.\n"
+    )
 
 
 def extract_json(text: str) -> str:
@@ -102,17 +107,65 @@ def validate_data(data: dict) -> dict:
         if field not in data or data[field] is None:
             data[field] = default
 
-    # Corregir action_items con valores inválidos
+    # Validar speakers
+    speaker_names = set()
+    for s in data.get("speakers", []):
+        if not isinstance(s, dict):
+            continue
+        name = (s.get("name") or "").strip()
+        if name:
+            speaker_names.add(name.lower())
+
+    # Corregir action_items
     for item in data.get("action_items", []):
         if item.get("priority") not in _VALID_PRIORITY:
             item["priority"] = "medium"
         if item.get("status") not in _VALID_STATUS:
             item["status"] = "todo"
-        # Normalizar area vacía
         if not item.get("area"):
             item["area"] = "general"
+        # Limpiar task sin verbo (probable ruido)
+        task = (item.get("task") or "").strip()
+        if len(task) < 5:
+            item["task"] = task or "Tarea sin descripción"
+        # Validar owner existe como speaker (advertencia, no corrección)
+        owner = (item.get("owner") or "").strip()
+        if owner and owner.lower() not in speaker_names:
+            item.setdefault("_warnings", []).append("owner_not_speaker")
+
+    # Validar decisions
+    for d in data.get("decisions", []):
+        if not isinstance(d, dict):
+            continue
+        owner = (d.get("owner") or "").strip()
+        if owner and owner.lower() not in speaker_names:
+            d.setdefault("_warnings", []).append("owner_not_speaker")
+
+    # Eliminar topics vacíos
+    data["topics"] = [
+        t for t in data.get("topics", [])
+        if isinstance(t, dict) and t.get("bullets")
+    ]
 
     return data
+
+
+def get_validation_warnings(data: dict) -> list[str]:
+    """Extrae advertencias de validación del JSON procesado."""
+    warnings = []
+    for item in data.get("action_items", []):
+        if "owner_not_speaker" in item.get("_warnings", []):
+            warnings.append(
+                f"Tarea '{item.get('task', '?')[:40]}' tiene owner "
+                f"'{item.get('owner')}' que no es speaker"
+            )
+    for d in data.get("decisions", []):
+        if "owner_not_speaker" in d.get("_warnings", []):
+            warnings.append(
+                f"Decisión '{d.get('decision', '?')[:40]}' tiene owner "
+                f"'{d.get('owner')}' que no es speaker"
+            )
+    return warnings
 
 
 def repair_json(client, model: str, key_manager, candidate: str) -> dict:

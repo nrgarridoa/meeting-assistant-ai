@@ -130,3 +130,5 @@ websocket-client==1.9.0
 websockets==15.0.1
 widgetsnbextension==4.0.15
 yarl==1.22.0
+fpdf2==2.8.7
+notion-client==3.0.0
