@@ -11,8 +11,10 @@ from .report import (
     generate_report,
     report_to_markdown,
 )
-from .stats import compute_stats, stats_to_text
+from .stats import compute_stats, stats_to_text, compare_periods, comparison_to_text, sort_tasks, get_overdue_tasks
 from .action_tracking import track_actions, tracking_to_text
 from .search import search_meetings, search_to_text
-from .pdf_export import report_to_pdf
+from .pdf_export import report_to_pdf, stats_to_pdf
 from .notion_sync import upload_to_notion, upload_tasks_to_notion, pull_tasks_from_notion, sync_notion_to_local, load_manual_tasks
+from .email_report import send_report_email
+from .meeting_template import generate_template

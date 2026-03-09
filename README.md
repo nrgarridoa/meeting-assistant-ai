@@ -57,7 +57,9 @@ Pipeline completo: `.docx` → JSON estructurado → Markdown → PDF → Notion
 │       ├── stats.py               ← Dashboard de metricas (0 requests)
 │       ├── action_tracking.py     ← Seguimiento de tareas entre periodos
 │       ├── search.py              ← Busqueda sobre reuniones
-│       └── notion_sync.py         ← Sincronizacion bidireccional con Notion
+│       ├── notion_sync.py         ← Sincronizacion bidireccional con Notion
+│       ├── email_report.py        ← Envio de reportes por correo (SMTP)
+│       └── meeting_template.py    ← Generacion de agendas desde pendientes
 ├── transcriptions/                ← YYMMDD_tema.docx (input)
 ├── outputs/                       ← JSONs + MDs individuales (procesados)
 └── reports/                       ← Reportes ejecutivos (JSON + MD + PDF)
@@ -93,6 +95,16 @@ GEMINI_MODEL=models/gemini-2.5-flash
 
 # ── Notion (opcional) ──
 NOTION_TOKEN=ntn_xxx
+NOTION_MEETINGS_DB_ID=xxx
+NOTION_REPORTS_DB_ID=xxx
+NOTION_TASKS_DB_ID=xxx
+
+# ── Email (opcional) ──
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=tucorreo@gmail.com
+SMTP_PASSWORD=xxxx xxxx xxxx xxxx
+SMTP_TO=destinatario@empresa.com
 NOTION_MEETINGS_DB_ID=xxx    # Database/pagina de minutas
 NOTION_REPORTS_DB_ID=xxx     # Database/pagina de reportes
 NOTION_TASKS_DB_ID=xxx       # Database de action items
@@ -144,14 +156,16 @@ python -m meeting_assistant process                          # Procesar transcri
 python -m meeting_assistant process --context "Daily team"   # Con contexto manual
 
 # ── Reportes ──
-python -m meeting_assistant report --tipo semanal                     # Reporte semanal
-python -m meeting_assistant report --tipo mensual --fecha 2026-03-01  # Mensual de marzo
-python -m meeting_assistant report --tipo semanal --pdf               # Con PDF
-python -m meeting_assistant report --tipo semanal --pdf --notion      # Con PDF + subir a Notion
+python -m meeting_assistant report --tipo semanal                            # Reporte semanal
+python -m meeting_assistant report --tipo mensual --fecha 2026-03-01         # Mensual de marzo
+python -m meeting_assistant report --tipo semanal --pdf                      # Con PDF
+python -m meeting_assistant report --tipo semanal --pdf --notion --email     # PDF + Notion + email
 
 # ── Metricas (0 requests Gemini) ──
-python -m meeting_assistant stats                                     # Todas las reuniones
-python -m meeting_assistant stats --fecha 2026-03-04 --tipo semanal   # Periodo especifico
+python -m meeting_assistant stats                                            # Todas las reuniones
+python -m meeting_assistant stats --fecha 2026-03-04 --tipo semanal          # Periodo especifico
+python -m meeting_assistant stats --project Chinalco                         # Filtrar por proyecto
+python -m meeting_assistant stats --fecha 2026-03-04 --tipo semanal --compare --pdf  # Comparativa + PDF
 
 # ── Busqueda ──
 python -m meeting_assistant search "Chinalco"                         # Buscar en todo
@@ -160,6 +174,7 @@ python -m meeting_assistant search "Harold" --scope speakers          # Solo spe
 
 # ── Seguimiento de tareas ──
 python -m meeting_assistant tracking --fecha 2026-03-04 --tipo semanal
+python -m meeting_assistant tracking --project HH4M                   # Filtrar por proyecto
 
 # ── Notion: Push ──
 python -m meeting_assistant notion --file outputs/260304_daily-team.md --title "Daily" --type minuta
@@ -169,6 +184,16 @@ python -m meeting_assistant notion-tasks --fecha 2026-03-04           # Solo de 
 # ── Notion: Pull (sincronizar cambios de vuelta) ──
 python -m meeting_assistant notion-pull                               # Sync desde Notion
 python -m meeting_assistant notion-pull --show-manual                 # Mostrar tareas manuales
+
+# ── Templates de reunion ──
+python -m meeting_assistant template --tipo daily                     # Agenda daily
+python -m meeting_assistant template --tipo semanal                   # Agenda semanal
+python -m meeting_assistant template --project Chinalco               # Agenda de proyecto
+python -m meeting_assistant template --tipo daily -o agenda.md        # Guardar en archivo
+
+# ── Correo electronico ──
+python -m meeting_assistant email --file reports/reporte_semanal.md   # Enviar por correo
+python -m meeting_assistant email --file reports/X.md --attach reports/X.pdf  # Con adjunto
 ```
 
 ---
@@ -252,6 +277,82 @@ Puedes editar el mapeo en `notion_sync.py` (`_infer_project`) o asignar proyecto
 
 ---
 
+## Alertas de tareas vencidas
+
+El sistema detecta automaticamente tareas que necesitan atencion:
+- Tareas con `due_date` pasado y status != `done`
+- Tareas con mas de 14 dias sin avance (status `todo` desde la reunion)
+
+Las alertas aparecen al final de `stats` y se incluyen en el PDF de metricas.
+
+Las tareas se ordenan por urgencia:
+1. Tareas vencidas primero
+2. Prioridad: `high` > `medium` > `low`
+3. Status: `blocked` > `in_progress` > `todo` > `done`
+
+---
+
+## Comparativa entre periodos
+
+```bash
+python -m meeting_assistant stats --fecha 2026-03-04 --tipo semanal --compare
+```
+
+Muestra tabla comparativa:
+```
+Metrica                     Anterior     Actual     Cambio
+-------------------------------------------------------
+Reuniones                          1          6         +5
+Tareas                            33        103        +70
+Decisiones                        12         61        +49
+Completado (%)                  0.0%       0.0%       0.0%
+```
+
+---
+
+## Templates de reunion
+
+Genera agendas pre-llenadas con pendientes de reuniones anteriores:
+
+```bash
+python -m meeting_assistant template --tipo daily     # Daily standup
+python -m meeting_assistant template --tipo semanal   # Reunion semanal
+python -m meeting_assistant template --project HH4M   # Reunion de proyecto
+```
+
+El template incluye:
+- Tareas pendientes agrupadas por responsable (ordenadas por urgencia)
+- Bloqueos y riesgos activos
+- Preguntas abiertas de reuniones anteriores
+- Decisiones recientes para seguimiento
+
+---
+
+## Envio por correo
+
+Para enviar reportes por email (Gmail SMTP gratuito):
+
+1. Activar verificacion en 2 pasos en tu cuenta Google
+2. Crear App Password en https://myaccount.google.com/apppasswords
+3. Agregar al `.env`:
+   ```env
+   SMTP_HOST=smtp.gmail.com
+   SMTP_PORT=587
+   SMTP_USER=tucorreo@gmail.com
+   SMTP_PASSWORD=xxxx xxxx xxxx xxxx
+   SMTP_TO=gerente@empresa.com,jefe@empresa.com
+   ```
+4. Enviar:
+   ```bash
+   python -m meeting_assistant report --tipo semanal --pdf --email
+   # O enviar un archivo existente:
+   python -m meeting_assistant email --file reports/X.md --attach reports/X.pdf
+   ```
+
+Tambien funciona con Outlook (`SMTP_HOST=smtp.office365.com`).
+
+---
+
 ## Reportes ejecutivos
 
 Optimizados para gerencia: formato breve, bullets concisos, indicadores de estado.
@@ -262,12 +363,13 @@ Optimizados para gerencia: formato breve, bullets concisos, indicadores de estad
 | `.md` | Control personal, Notion |
 | `.pdf` | Enviar a gerencia |
 | Notion | Pagina directa en tu workspace |
+| Email | Envio directo con adjuntos |
 
 ![Reporte PDF](docs/images/reporte-pdf.png)
 
 Comando rapido:
 ```bash
-python -m meeting_assistant report --tipo semanal --pdf --notion
+python -m meeting_assistant report --tipo semanal --pdf --notion --email
 ```
 
 ---

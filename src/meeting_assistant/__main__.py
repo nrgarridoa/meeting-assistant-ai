@@ -3,12 +3,15 @@ CLI para Meeting Assistant.
 
 Uso:
   python -m meeting_assistant process [--context "..."]
-  python -m meeting_assistant report --tipo semanal [--fecha 2026-03-04] [--pdf]
-  python -m meeting_assistant stats [--fecha 2026-03-04] [--tipo semanal]
+  python -m meeting_assistant report --tipo semanal [--fecha 2026-03-04] [--pdf] [--email]
+  python -m meeting_assistant stats [--fecha 2026-03-04] [--tipo semanal] [--project Chinalco] [--pdf] [--compare]
   python -m meeting_assistant search "Chinalco" [--scope decisions]
-  python -m meeting_assistant tracking [--fecha 2026-03-04] [--tipo semanal]
+  python -m meeting_assistant tracking [--fecha 2026-03-04] [--tipo semanal] [--project Chinalco]
   python -m meeting_assistant notion --file outputs/260304_daily-team.md --title "Daily" --type minuta
   python -m meeting_assistant notion-pull [--show-manual]
+  python -m meeting_assistant notion-tasks [--fecha 2026-03-04]
+  python -m meeting_assistant template --tipo daily [--fecha 2026-03-08] [--project Chinalco]
+  python -m meeting_assistant email --file reports/reporte_semanal_X.md [--attach reports/X.pdf]
 """
 
 import argparse
@@ -129,10 +132,12 @@ def cmd_report(args):
     out_md = REPORTS_DIR / f"reporte_{tipo}_{safe_label}.md"
 
     out_json.write_text(json.dumps(report_data, ensure_ascii=False, indent=2), encoding="utf-8")
-    out_md.write_text(report_to_markdown(report_data), encoding="utf-8")
+    md_text = report_to_markdown(report_data)
+    out_md.write_text(md_text, encoding="utf-8")
     print(f"  JSON: {out_json}")
     print(f"  MD:   {out_md}")
 
+    out_pdf = None
     if args.pdf:
         from .pdf_export import report_to_pdf
         out_pdf = REPORTS_DIR / f"reporte_{tipo}_{safe_label}.pdf"
@@ -141,17 +146,23 @@ def cmd_report(args):
 
     if args.notion:
         from .notion_sync import upload_to_notion
-        md_text = report_to_markdown(report_data)
         url = upload_to_notion(md_text, title=report_data.get("report_title", label),
                                date=date_from.strftime("%Y-%m-%d"),
                                page_type="reporte", env_path=ENV_PATH)
         print(f"  Notion: {url}")
 
+    if args.email:
+        from .email_report import send_report_email
+        attachments = [out_pdf] if out_pdf else []
+        subject = f"Reporte {tipo.capitalize()}: {label}"
+        result = send_report_email(subject, md_text, attachments, env_path=ENV_PATH)
+        print(f"  Email: {result}")
+
 
 def cmd_stats(args):
     """Muestra metricas consolidadas."""
     from .report import load_all_meetings, filter_by_date_range, get_week_range, get_month_range
-    from .stats import compute_stats, stats_to_text
+    from .stats import compute_stats, stats_to_text, compare_periods, comparison_to_text
 
     all_meetings = load_all_meetings(OUT_DIR)
 
@@ -163,17 +174,50 @@ def cmd_stats(args):
         else:
             date_from, date_to = get_month_range(ref)
         meetings = filter_by_date_range(all_meetings, date_from, date_to)
-        print(f"Stats ({tipo}: {date_from.strftime('%Y-%m-%d')} a {date_to.strftime('%Y-%m-%d')}):")
+        period_label = f"{tipo}: {date_from.strftime('%Y-%m-%d')} a {date_to.strftime('%Y-%m-%d')}"
+        print(f"Stats ({period_label}):")
     else:
         meetings = all_meetings
+        date_from = date_to = None
+        tipo = args.tipo
+        period_label = "todas las reuniones"
         print("Stats (todas las reuniones):")
 
     if not meetings:
         print("  Sin reuniones para el periodo.")
         return
 
-    stats = compute_stats(meetings)
+    project = args.project or ""
+    stats = compute_stats(meetings, project=project)
     print(stats_to_text(stats))
+
+    # Comparativa entre periodos
+    comparison = None
+    if args.compare and date_from and date_to:
+        tipo = tipo or "semanal"
+        if tipo == "semanal":
+            prev_from = date_from - timedelta(days=7)
+            prev_to = date_from - timedelta(seconds=1)
+        else:
+            prev_to = date_from - timedelta(seconds=1)
+            prev_from, _ = get_month_range(prev_to)
+        prev_meetings = filter_by_date_range(all_meetings, prev_from, prev_to)
+        if prev_meetings:
+            comparison = compare_periods(meetings, prev_meetings, project=project)
+            print(f"\n{comparison_to_text(comparison)}")
+        else:
+            print("\n  (Sin datos del periodo anterior para comparar)")
+
+    # PDF de stats
+    if args.pdf:
+        from .pdf_export import stats_to_pdf
+        REPORTS_DIR.mkdir(exist_ok=True)
+        safe = period_label.replace(" ", "_").replace(":", "").replace("/", "-")
+        if project:
+            safe += f"_{project}"
+        out_pdf = REPORTS_DIR / f"stats_{safe}.pdf"
+        stats_to_pdf(stats, out_pdf, comparison=comparison)
+        print(f"\n  PDF: {out_pdf}")
 
 
 def cmd_search(args):
@@ -190,6 +234,7 @@ def cmd_tracking(args):
     """Muestra seguimiento de action items entre periodos."""
     from .report import load_all_meetings, filter_by_date_range, get_week_range, get_month_range
     from .action_tracking import track_actions, tracking_to_text
+    from .stats import _filter_by_project
 
     all_meetings = load_all_meetings(OUT_DIR)
     ref = datetime.strptime(args.fecha, "%Y-%m-%d") if args.fecha else datetime.now()
@@ -207,7 +252,15 @@ def cmd_tracking(args):
     current = filter_by_date_range(all_meetings, date_from, date_to)
     prev = filter_by_date_range(all_meetings, prev_from, prev_to)
 
-    print(f"Tracking ({tipo}: {date_from.strftime('%Y-%m-%d')} a {date_to.strftime('%Y-%m-%d')}):")
+    # Filtro por proyecto
+    if args.project:
+        current = _filter_by_project(current, args.project)
+        prev = _filter_by_project(prev, args.project)
+
+    label = f"{tipo}: {date_from.strftime('%Y-%m-%d')} a {date_to.strftime('%Y-%m-%d')}"
+    if args.project:
+        label += f" | Proyecto: {args.project}"
+    print(f"Tracking ({label}):")
 
     if not current:
         print("  Sin reuniones en el periodo actual.")
@@ -303,6 +356,68 @@ def cmd_notion_tasks(args):
             print(f"    - {e}")
 
 
+def cmd_template(args):
+    """Genera template/agenda para la siguiente reunion."""
+    from .report import load_all_meetings, filter_by_date_range, get_week_range, get_month_range
+    from .meeting_template import generate_template
+    from .stats import _filter_by_project
+
+    all_meetings = load_all_meetings(OUT_DIR)
+
+    # Usar reuniones recientes (ultima semana por defecto)
+    ref = datetime.strptime(args.fecha, "%Y-%m-%d") if args.fecha else datetime.now()
+    date_from, date_to = get_week_range(ref)
+    meetings = filter_by_date_range(all_meetings, date_from, date_to)
+
+    # Si no hay de esta semana, usar todas
+    if not meetings:
+        meetings = all_meetings
+
+    # Filtro por proyecto
+    if args.project:
+        meetings = _filter_by_project(meetings, args.project)
+
+    meeting_type = args.tipo
+    if args.project and meeting_type == "daily":
+        meeting_type = args.project  # Usar nombre de proyecto como tipo
+
+    template = generate_template(meetings, meeting_type=meeting_type, ref_date=ref)
+
+    # Guardar o imprimir
+    if args.output:
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(template, encoding="utf-8")
+        print(f"Template guardado: {out_path}")
+    else:
+        print(template)
+
+
+def cmd_email(args):
+    """Envia un reporte por correo electronico."""
+    from .email_report import send_report_email
+
+    md_path = Path(args.file)
+    if not md_path.exists():
+        print(f"Archivo no encontrado: {md_path}")
+        sys.exit(1)
+
+    md_text = md_path.read_text(encoding="utf-8")
+    subject = args.subject or f"Meeting Assistant — {md_path.stem}"
+
+    attachments = []
+    if args.attach:
+        for a in args.attach:
+            p = Path(a)
+            if p.exists():
+                attachments.append(p)
+            else:
+                print(f"  Adjunto no encontrado: {a}")
+
+    result = send_report_email(subject, md_text, attachments, env_path=ENV_PATH)
+    print(result)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="meeting_assistant",
@@ -320,11 +435,15 @@ def main():
     p_rep.add_argument("--fecha", "-f", default=None, help="Fecha referencia YYYY-MM-DD")
     p_rep.add_argument("--pdf", action="store_true", help="Tambien generar PDF")
     p_rep.add_argument("--notion", action="store_true", help="Subir a Notion")
+    p_rep.add_argument("--email", action="store_true", help="Enviar por correo")
 
     # stats
     p_stats = sub.add_parser("stats", help="Dashboard de metricas")
     p_stats.add_argument("--fecha", "-f", default=None, help="Fecha referencia YYYY-MM-DD")
     p_stats.add_argument("--tipo", "-t", default=None, choices=["semanal", "mensual"])
+    p_stats.add_argument("--project", "-p", default=None, help="Filtrar por proyecto")
+    p_stats.add_argument("--pdf", action="store_true", help="Exportar stats a PDF")
+    p_stats.add_argument("--compare", action="store_true", help="Comparar con periodo anterior")
 
     # search
     p_search = sub.add_parser("search", help="Buscar en reuniones")
@@ -336,6 +455,7 @@ def main():
     p_track = sub.add_parser("tracking", help="Seguimiento de action items")
     p_track.add_argument("--fecha", "-f", default=None, help="Fecha referencia YYYY-MM-DD")
     p_track.add_argument("--tipo", "-t", default="semanal", choices=["semanal", "mensual"])
+    p_track.add_argument("--project", "-p", default=None, help="Filtrar por proyecto")
 
     # notion
     p_notion = sub.add_parser("notion", help="Subir archivo MD a Notion")
@@ -356,6 +476,20 @@ def main():
     p_ntasks.add_argument("--no-update", action="store_true",
                           help="No actualizar tareas existentes (solo crear nuevas)")
 
+    # template
+    p_tmpl = sub.add_parser("template", help="Generar agenda/template para reunion")
+    p_tmpl.add_argument("--tipo", "-t", default="daily", choices=["daily", "semanal"],
+                        help="Tipo de reunion")
+    p_tmpl.add_argument("--fecha", "-f", default=None, help="Fecha referencia YYYY-MM-DD")
+    p_tmpl.add_argument("--project", "-p", default=None, help="Filtrar por proyecto")
+    p_tmpl.add_argument("--output", "-o", default=None, help="Guardar en archivo (default: stdout)")
+
+    # email
+    p_email = sub.add_parser("email", help="Enviar reporte por correo")
+    p_email.add_argument("--file", required=True, help="Archivo .md a enviar")
+    p_email.add_argument("--subject", "-s", default=None, help="Asunto del correo")
+    p_email.add_argument("--attach", "-a", nargs="*", help="Archivos adjuntos (PDFs, etc.)")
+
     args = parser.parse_args()
 
     commands = {
@@ -367,6 +501,8 @@ def main():
         "notion": cmd_notion,
         "notion-pull": cmd_notion_pull,
         "notion-tasks": cmd_notion_tasks,
+        "template": cmd_template,
+        "email": cmd_email,
     }
     commands[args.command](args)
 
